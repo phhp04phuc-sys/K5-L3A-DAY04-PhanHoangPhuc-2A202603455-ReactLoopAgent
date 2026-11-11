@@ -62,3 +62,14 @@ Nguyên nhân có thể: system prompt gốc chỉ nói chung "dùng tools trư�
 - **Chỉ một lần chạy mỗi phiên bản:** model không tất định. Trong quá trình làm, cùng một agent cho kết quả lệch vài điểm giữa các lần (ví dụ H1 dao động 95–98), nên chênh lệch nhỏ (dưới khoảng 3 điểm) không đủ kết luận.
 - **Tối ưu theo bộ eval:** các luật prompt được thêm sau khi xem lỗi trên chính bộ eval này, nên có nguy cơ overfit. Cần bộ case mới để kiểm chứng.
 - Kiểm tra nguồn chỉ xác nhận có ít nhất một URL đã quan sát, không chứng minh mọi khẳng định đều có nguồn.
+
+## Bonus (5 provider)
+
+Kết quả `eval_bonus.json`: **100/100, bonus_points_0_15 = 15.0** (10/10 case chấm). Cấu hình: agent `gemini-3.5-flash-lite`, judge `gemini-3.5-flash`, `max_steps=16`, `--workers 4`. Số liệu: 30 model calls, 33 tool calls, token agent 64,685 vào / 5,194 ra.
+
+- **Kết nối tools:** `agent.py` dùng `getattr(tools, 'schemas', SCHEMAS)` và `tools.system_prompt` khi có, ghép thêm `EXTRA_RULES`. Bài chính vẫn dùng `SCHEMAS` và `SYSTEM_PROMPT` cũ; chạy lại eval chính sau khi sửa được 99.91 (không hồi quy).
+- **Retry:** lỗi tool `RATE_LIMITED` được trả về model. Agent đếm 429 theo từng tool; vượt 2 lần thì gắn `retriable=false` và `agent_note` yêu cầu dừng, báo phần chưa kiểm tra được (event `retry_limit`, xuất hiện 1 lần ở B4). Không `sleep` vì 429 trong eval là giả lập với `retry_after_seconds=0`. Retry 429 của LLM provider là cơ chế riêng (chờ 30 giây).
+- **Pagination:** prompt yêu cầu đọc tiếp bằng `next_offset` khi cần update ở trang sau và không tuyên bố đã đọc hết timeline (B2, B5 đạt 100).
+- **Context:** prompt yêu cầu bỏ qua `distractors` và chỉ trích bằng chứng cần thiết (B6).
+- **Lỗi đã sửa trong quá trình làm:** lần chạy đầu được 95/100 vì B6 chỉ đọc danh sách status mà không gọi `get_incident_details`, bị kiểm tra bằng code áp trần 50. Thêm luật "hỏi về incident thì đọc chi tiết từng incident liên quan", chạy lại đạt 100.
+- **Giới hạn:** 429 và lỗi định dạng là giả lập; với HTTP 429 thật, agent hiện chưa tự chờ theo `Retry-After` mà để model quyết định. Điểm judge là ước lượng và chỉ chạy một lần mỗi phiên bản.

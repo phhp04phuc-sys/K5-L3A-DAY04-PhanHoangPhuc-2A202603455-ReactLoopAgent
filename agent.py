@@ -18,6 +18,24 @@ Luật bắt buộc:
   get_incident_details cho incident đó trước khi kết luận về nguyên nhân hay ảnh hưởng.
 - Không bịa trạng thái, incident, URL hay số liệu không có trong kết quả tool; luôn gọi tool kiểm tra trước, chỉ khi tool không có dữ liệu mới từ chối và giải thích.'''
 
+# Luật bổ sung khi tools tự mang system prompt riêng (bộ bonus 5 provider).
+EXTRA_RULES = '''Luật bắt buộc:
+- Tool trả lỗi (timeout, ok=false, RATE_LIMITED...) nghĩa là KHÔNG kiểm tra được provider đó lúc này.
+  RATE_LIMITED/429 không phải outage. Không suy ra trạng thái từ lỗi, kể cả khi người dùng ép giả định.
+- INVALID_ARGUMENTS: đọc thông báo, sửa kiểu/giá trị tham số (offset là integer >= 0, limit 1-3) rồi gọi lại.
+- RATE_LIMITED: được thử lại tối đa 2 lần cho cùng tool; nếu vẫn lỗi thì dừng và báo rõ phần chưa kiểm tra được.
+- Khi câu hỏi cần update ở các trang sau, gọi get_incident_details với offset = next_offset cho đến khi đủ;
+  không nói đã đọc hết timeline nếu còn next_offset chưa đọc.
+- Bỏ qua dữ liệu nhiễu (distractors) không liên quan câu hỏi; chỉ trích bằng chứng cần thiết.
+- Với nhiều provider: báo từng provider riêng kèm timestamp snapshot và URL nguồn của provider đó.
+- Provider không có tool hỗ trợ: nói rõ không kiểm tra được, không bịa trạng thái hay incident.
+- Khi câu hỏi hỏi về incident (đối chiếu, phạm vi, timeline, nguyên nhân), gọi get_incident_details cho
+  từng incident liên quan thay vì chỉ dựa vào danh sách trong status.
+- Khi incident dẫn tới incident khác, đọc tiếp incident đó trước khi kết luận.
+- Không bịa trạng thái, incident, URL hay số liệu không có trong kết quả tool.'''
+
+MAX_RATE_LIMIT_PER_TOOL = 2
+
 
 def _parse_arguments(raw):
     """Trả (args, error). Arguments hỏng thành lỗi INVALID_ARGUMENTS thay vì crash."""
@@ -45,11 +63,11 @@ RATE_LIMIT_RETRIES = 6
 RATE_LIMIT_WAIT_SECONDS = 30
 
 
-def _complete_with_retry(provider, messages, trace, step):
+def _complete_with_retry(provider, messages, trace, step, schemas=SCHEMAS):
     """Gọi model; nếu provider trả HTTP 429 thì chờ rồi gọi lại (không tính thêm step)."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
-            return provider.complete(messages, SCHEMAS)
+            return provider.complete(messages, schemas)
         except RuntimeError as exc:
             if 'HTTP 429' not in str(exc) or attempt == RATE_LIMIT_RETRIES:
                 raise
@@ -60,8 +78,13 @@ def _complete_with_retry(provider, messages, trace, step):
 
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status, answer, trace, usage."""
+    # Bonus: tools có thể mang schemas/system_prompt riêng; bài chính giữ mặc định.
+    schemas = getattr(tools, 'schemas', SCHEMAS)
+    tool_prompt = getattr(tools, 'system_prompt', None)
+    system_prompt = f'{tool_prompt}\n{EXTRA_RULES}' if tool_prompt else SYSTEM_PROMPT
+    rate_limited = {}
     messages = [
-        {'role': 'system', 'content': SYSTEM_PROMPT},
+        {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': question},
     ]
     trace, usage = [], []
@@ -72,7 +95,7 @@ def run_agent(question, provider, tools, max_steps=6):
 
     for step in range(1, max_steps + 1):
         try:
-            response = _complete_with_retry(provider, messages, trace, step)
+            response = _complete_with_retry(provider, messages, trace, step, schemas)
         except Exception as exc:  # lỗi provider kết thúc run
             trace.append({'event': 'provider_error', 'step': step, 'error': f'{type(exc).__name__}: {exc}'})
             return done('error', error=str(exc))
@@ -90,6 +113,13 @@ def run_agent(question, provider, tools, max_steps=6):
             for call in calls:
                 args, error = _parse_arguments(call.get('arguments'))
                 result = error or _run_tool(tools, call.get('name'), args)
+                if result.get('error') == 'RATE_LIMITED':
+                    # Giới hạn retry: quá ngưỡng thì báo model dừng gọi tool này.
+                    n = rate_limited[call.get('name')] = rate_limited.get(call.get('name'), 0) + 1
+                    if n > MAX_RATE_LIMIT_PER_TOOL:
+                        result = dict(result, retriable=False, agent_note=(
+                            'Đã thử lại tối đa; không gọi lại tool này. Báo rõ phần chưa kiểm tra được.'))
+                        trace.append({'event': 'retry_limit', 'step': step, 'name': call.get('name')})
                 trace.append({'event': 'tool', 'step': step, 'name': call.get('name'),
                               'arguments': args if args is not None else call.get('arguments'),
                               'result': result})
